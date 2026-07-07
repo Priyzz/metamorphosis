@@ -2,40 +2,27 @@
 
 ## Architecture Principles
 
-Proyek ini mengikuti prinsip Clean Architecture dengan penyesuaian untuk Next.js + Supabase:
+Proyek ini local-first: semua logika dan data jalan di browser (client-side), tanpa backend. Prinsip Clean Architecture tetap dipakai, tapi disesuaikan — Data Layer bukan lagi Supabase/Postgres di server, melainkan IndexedDB (via Dexie) di browser yang sama dengan Business Logic Layer.
 
 ### 1. **Separation of Concerns**
 
-- **Presentation Layer** (`app/components`, `app/(auth)`, `app/(main)`): UI components dan pages
-- **Business Logic Layer** (`app/lib`, `app/api`): Aturan bisnis (kalkulasi momentum, level, penalty) dan API routes
-- **Data Layer** (Supabase: tables, RLS policies, database functions): Skema database dan akses data
+- **Presentation Layer** (`app/components`, `app/(main)`): UI components dan pages
+- **Business Logic Layer** (`app/lib`): Aturan bisnis (kalkulasi momentum, level, penalty) — dipanggil langsung dari komponen/hook, bukan lewat API routes
+- **Data Layer** (`app/lib/db.ts`): Definisi tabel Dexie/IndexedDB dan akses data
+
+Karena semuanya jalan di browser yang sama, ketiga layer ini hidup dalam satu runtime (tidak ada network boundary antara Business Logic dan Data Layer seperti pada arsitektur client-server).
 
 ### 2. **Folder Structure**
 
 ```
 app/
-├── (auth)/                    # Route group untuk autentikasi
-│   ├── login/
-│   └── register/
 ├── (main)/                    # Route group untuk halaman utama
 │   ├── dashboard/             # Ringkasan quest hari ini + status level
 │   ├── quests/                # Manajemen quest (CRUD, tandai selesai/gagal)
 │   ├── rewards/                # Reward shop
 │   ├── journal/                # Jurnal refleksi (hasil checkpoint level up)
 │   ├── history/                # Riwayat quest & reward yang ditukar
-│   └── settings/               # Konfigurasi penalty, tema, preferensi
-├── api/                        # API routes (Route Handlers)
-│   ├── quests/
-│   │   ├── route.ts            # GET, POST /api/quests
-│   │   └── [id]/
-│   │       └── route.ts        # PATCH (selesai/gagal), DELETE
-│   ├── rewards/
-│   │   ├── route.ts            # GET, POST /api/rewards
-│   │   └── [id]/redeem/
-│   │       └── route.ts        # POST /api/rewards/:id/redeem
-│   ├── momentum/                # Endpoint kalkulasi & pengecekan decay
-│   ├── journal/                 # CRUD entry refleksi
-│   └── themes/                  # Unlock & pemilihan tema
+│   └── settings/               # Konfigurasi penalty, decay, tema, preferensi
 ├── components/
 │   ├── ui/                     # Primitif UI (Button, Input, Card, Modal)
 │   ├── layout/                 # Navbar, Sidebar, ThemeProvider
@@ -44,16 +31,16 @@ app/
 │   ├── level/                  # LevelProgressBar, ReflectionModal
 │   └── theme/                  # ThemePicker, ThemePreview
 ├── lib/
-│   ├── supabase/
-│   │   ├── client.ts           # Supabase client (browser)
-│   │   ├── server.ts           # Supabase client (server components/actions)
-│   │   └── middleware.ts       # Session refresh middleware
-│   ├── momentum.ts             # Logika Momentum Score & decay
-│   ├── level.ts                 # Formula konversi Momentum Score → Level
-│   ├── penalty.ts               # Kalkulasi potongan poin saat quest gagal
-│   └── utils.ts                 # Helper umum
-└── types/                      # Definisi TypeScript (Quest, Reward, User, dll)
+│   ├── db.ts                    # Definisi database Dexie (semua tabel + helper get/update)
+│   ├── momentum.ts              # Logika Momentum Score & decay
+│   ├── level.ts                  # Formula konversi Momentum Score → Level
+│   ├── penalty.ts                # Kalkulasi potongan poin saat quest gagal
+│   ├── backup.ts                 # Export/import data ke JSON (satu-satunya cara backup, karena tidak ada cloud)
+│   └── utils.ts                  # Helper umum
+└── types/                       # Definisi TypeScript (Quest, Reward, Theme, dll) — biasanya re-export dari lib/db.ts
 ```
+
+Tidak ada `app/api/` dan tidak ada `app/(auth)/`. Tidak ada API routes karena tidak ada server logic untuk dituju — komponen memanggil fungsi di `app/lib` secara langsung, dan fungsi-fungsi itu membaca/menulis ke `db.ts`. Tidak ada auth karena hanya ada satu user per browser.
 
 ### 3. **Component Organization**
 
@@ -61,55 +48,54 @@ app/
 - **Feature Components**: Komponen dengan logika bisnis spesifik (QuestCard, RewardCard, LevelProgressBar)
 - **Page Components**: Komponen spesifik per route
 
-### 4. **API Routes Structure**
+### 4. **Data Access Pattern**
+
+Tidak ada API routes — pola aksesnya langsung: **Component/Hook → `app/lib/*.ts` → `app/lib/db.ts` (Dexie)**.
+
+Contoh alur "tandai quest selesai":
 
 ```
-app/api/
-├── quests/
-│   ├── route.ts                    # GET semua quest, POST quest baru
-│   └── [id]/route.ts               # PATCH status (selesai/gagal), DELETE
-├── rewards/
-│   ├── route.ts                    # GET semua reward, POST reward baru
-│   └── [id]/redeem/route.ts        # POST tukar reward dengan poin
-├── momentum/route.ts               # GET status momentum, trigger recalculation decay
-├── journal/route.ts                # GET/POST entry refleksi
-└── themes/
-    ├── route.ts                    # GET tema yang sudah unlock
-    └── [id]/activate/route.ts      # POST set tema aktif
+QuestCard (component)
+  → completeQuest(questId)  // app/lib/momentum.ts
+      → db.quests.update(...)         // app/lib/db.ts
+      → calculateLevel(newMomentum)   // app/lib/level.ts
+      → db.momentumHistory.add(...)   // app/lib/db.ts
+      → db.settings.update(...)       // app/lib/db.ts
 ```
 
-### 5. **Database Layer (Supabase)**
+Fungsi-fungsi di `app/lib` yang menyentuh lebih dari satu tabel (misal redeem reward: kurangi poin di `settings` + tambah baris di `rewardRedemptions`) sebaiknya dibungkus dalam satu fungsi async dan dijalankan lewat `db.transaction(...)` milik Dexie, supaya tetap atomik walau tanpa database server.
 
-- Gunakan Supabase (PostgreSQL) sebagai satu-satunya sumber kebenaran skema
-- Setiap tabel utama memiliki kolom `user_id` sejak awal (siap multi-user)
-- **Row Level Security (RLS)** diaktifkan di semua tabel — user hanya bisa akses data miliknya sendiri
-- Gunakan **Postgres functions/triggers** untuk logika yang harus konsisten di level database (contoh: update Total EXP saat quest ditandai selesai)
-- Gunakan transaction (via RPC/Postgres function) untuk operasi yang menyentuh banyak tabel sekaligus (contoh: redeem reward → kurangi poin + catat log riwayat)
-- Soft delete untuk quest/reward yang dihapus (kolom `deleted_at`), agar riwayat tetap utuh
+### 5. **Data Layer (Dexie / IndexedDB)**
+
+- `app/lib/db.ts` sebagai satu-satunya sumber kebenaran skema (tabel, tipe, index)
+- Tidak ada kolom `user_id` dan tidak ada RLS — hanya ada satu user per browser, jadi tidak relevan
+- Tabel `settings` cuma punya 1 baris (`id: 'singleton'`) untuk state agregat: total EXP, momentum score, level, config decay & penalty, tema aktif
+- Gunakan `db.transaction('rw', [...tabel], async () => {...})` untuk operasi yang menyentuh banyak tabel sekaligus (contoh: redeem reward)
+- Soft delete (`isArchived` / `deletedAt`) untuk quest/reward yang dihapus, agar riwayat tetap utuh
+- **Backup manual**: karena tidak ada cloud, `lib/backup.ts` menyediakan export seluruh tabel ke file JSON dan import kembali — ini pengganti "cadangan otomatis" yang biasanya didapat gratis dari database cloud
 
 ### 6. **State Management**
 
-- Server Components sebagai default (Next.js App Router)
-- Client Components hanya untuk elemen interaktif (form quest, form reward, theme picker, reflection modal)
-- Gunakan **Next.js Server Actions** untuk mutasi data (buat quest, tandai selesai, redeem reward)
-- URL state untuk filter/paginasi riwayat (misal `?status=completed`)
+- Karena IndexedDB hanya bisa diakses dari browser, halaman yang menampilkan data (dashboard, quests, rewards, journal, history) harus **Client Components** (`"use client"`) — Server Components tidak bisa membaca Dexie karena mereka render di server
+- Tidak ada Next.js Server Actions untuk mutasi data (Server Actions jalan di server, tidak punya akses ke IndexedDB browser) — mutasi dilakukan lewat fungsi client-side biasa di `app/lib`, dipanggil dari event handler (`onClick`, `onSubmit`, dst)
+- State lokal komponen (`useState`) atau state management ringan (misal `zustand`) untuk cache di memori supaya tidak query Dexie berulang kali dalam satu render; sinkronkan ulang setelah tiap mutasi
+- URL state untuk filter/paginasi riwayat (misal `?status=completed`) tetap relevan, tidak berubah dari sebelumnya
 
 ### 7. **Security Best Practices**
 
-- Validasi input di semua form (gunakan Zod untuk schema validation)
-- Supabase RLS sebagai lapisan utama pencegahan akses data lintas user
+- Validasi input di semua form (gunakan Zod untuk schema validation) — sekarang jadi lapisan pertahanan utama, karena tidak ada validasi server terpisah
 - Proteksi XSS (React escape secara default)
-- Autentikasi & session management via Supabase Auth
-- Rate limiting pada API routes yang sensitif (contoh: redeem reward)
-- Validasi ulang di server untuk kalkulasi poin/level (jangan percaya nilai dari client)
+- Tidak ada isu akses data lintas user (tidak ada auth, tidak ada user lain) — tapi karena itu juga, jangan simpan data sensitif (password, token pihak ketiga, dll) di IndexedDB tanpa enkripsi, karena siapa pun yang punya akses ke device/browser bisa membaca lewat DevTools
+- Tidak perlu rate limiting (tidak ada API routes/server untuk diserang)
+- Kalkulasi poin/level tetap divalidasi di titik yang sama tempat data ditulis (`app/lib`), supaya UI tidak bisa langsung menulis nilai sembarangan ke `db.ts` tanpa lewat aturan bisnis
 
 ### 8. **Performance Optimization**
 
 - Next.js Image component untuk aset visual (tema, ikon rank)
 - Lazy loading untuk komponen berat (modal refleksi, theme picker)
-- Query Supabase hanya select kolom yang diperlukan
-- Static generation untuk halaman yang tidak butuh data real-time (landing page, jika ada)
-- Caching ringan untuk daftar tema yang sudah unlock
+- Query Dexie hanya field/index yang diperlukan (manfaatkan index yang didefinisikan di `db.ts`, contoh: `quests.where('status').equals('pending')`)
+- Static generation tetap relevan untuk halaman yang benar-benar statis (landing page, jika ada) — tapi halaman yang baca IndexedDB otomatis butuh client-side rendering
+- Caching ringan di memori (bukan network cache) untuk daftar tema yang sudah unlock, supaya tidak query Dexie di setiap re-render
 
 ### 9. **Code Style**
 
@@ -122,9 +108,9 @@ app/api/
 ### 10. **Testing Strategy**
 
 - Unit test untuk logika bisnis inti: kalkulasi Momentum Score, decay, formula level, penalty
-- Integration test untuk API routes (quest CRUD, redeem reward)
-- E2E test untuk flow kritis: buat quest → selesaikan → cek level naik → redeem reward
-- Mock Supabase client saat testing logika bisnis murni
+- Integration test untuk operasi `db.ts`: gunakan [`fake-indexeddb`](https://www.npmjs.com/package/fake-indexeddb) supaya Dexie bisa jalan di lingkungan Node (Jest/Vitest) tanpa browser sungguhan
+- E2E test (Playwright) untuk flow kritis: buat quest → selesaikan → cek level naik → redeem reward — jalankan di browser asli karena butuh IndexedDB beneran
+- Tidak perlu mock database eksternal (tidak ada Supabase) — cukup reset IndexedDB (`db.delete()` lalu re-init) di antara test
 
 ## Development Workflow
 
@@ -141,8 +127,8 @@ app/api/
 
 3. **Deployment**
    - CI/CD otomatis via GitHub Actions (lint + test sebelum deploy)
-   - Environment staging (Supabase project terpisah) untuk uji coba sebelum production
-   - Deploy ke Vercel setelah lolos staging
+   - Tidak ada environment staging database (tidak ada backend) — cukup preview deployment Vercel per branch/PR untuk uji coba UI sebelum merge ke `main`
+   - Deploy ke Vercel setelah lolos CI
 
 ## Naming Conventions
 
@@ -150,16 +136,20 @@ app/api/
 - **Components**: PascalCase (`QuestCard`)
 - **Functions**: camelCase (`calculateMomentumScore`)
 - **Constants**: UPPER_SNAKE_CASE (`DEFAULT_DECAY_GRACE_DAYS`)
-- **Database**: snake_case (`user_id`, `created_at`, `momentum_score`)
+- **Database (Dexie)**: camelCase untuk nama tabel & field (`momentumHistory`, `createdAt`, `momentumScore`) — mengikuti konvensi TypeScript, bukan snake_case ala SQL
 
 ## Module Dependencies
 
 ```
 Presentation Layer
     ↓
-Business Logic Layer
+Business Logic Layer (app/lib)
     ↓
-Data Layer (Supabase)
+Data Layer (Dexie / IndexedDB, app/lib/db.ts)
 ```
 
-Data Layer tidak boleh bergantung pada Presentation Layer. Logika bisnis inti (momentum, level, penalty) ditempatkan di `app/lib`, bukan tersebar di dalam komponen UI, agar mudah di-test secara terpisah.
+Semua layer jalan di browser yang sama — tidak ada network boundary. Data Layer tetap tidak boleh bergantung pada Presentation Layer. Logika bisnis inti (momentum, level, penalty) ditempatkan di `app/lib`, bukan tersebar di dalam komponen UI, agar mudah di-test secara terpisah (lihat §10 — bisa di-test tanpa browser sungguhan berkat `fake-indexeddb`).
+
+## Catatan Migrasi ke Multi-device/Multi-user
+
+Kalau nanti app ini butuh sinkron lintas device atau multi-user, ini bukan penyesuaian kecil — Business Logic Layer (`app/lib`) perlu ditulis ulang supaya bicara ke backend (API routes/Server Actions) alih-alih langsung ke Dexie, dan baru backend itu yang bicara ke database beneran (misal Supabase/Postgres, dengan `user_id` + RLS). Struktur tabel di `db.ts` sengaja dibuat semirip mungkin dengan skema relasional supaya migrasi datanya (export JSON → import ke Postgres) tetap mudah, tapi bagian arsitektur di dokumen ini (§4, §6) akan berubah signifikan saat migrasi itu terjadi.
