@@ -38,6 +38,8 @@ export interface Quest {
   points: number; // diisi manual oleh user, harus > 0
   status: QuestStatus;
   questDate: string; // format YYYY-MM-DD, untuk tampilan "quest hari ini"
+  isDaily?: boolean; // penanda apakah quest ini berulang tiap hari
+  originalQuestId?: string; // ID quest pertama yang dibuat sebagai template
   createdAt: string; // ISO timestamp
   completedAt?: string; // diisi saat status berubah jadi completed/failed
 }
@@ -90,6 +92,7 @@ export interface Settings {
   totalExp: number;
   momentumScore: number;
   currentLevel: number;
+  coins: number;
 
   decayGracePeriodDays: number;
   decayPercentage: number;
@@ -144,10 +147,11 @@ const DEFAULT_SETTINGS: Settings = {
   totalExp: 0,
   momentumScore: 0,
   currentLevel: 1,
+  coins: 0,
   decayGracePeriodDays: 3,
   decayPercentage: 10,
   penaltyEnabled: true,
-  penaltyPercentage: 85,
+  penaltyPercentage: 50,
 };
 
 /** Ambil settings; kalau belum ada (first run), buat dengan nilai default. */
@@ -166,14 +170,4 @@ export async function updateSettings(
   await db.settings.update("singleton", patch);
   return (await db.settings.get("singleton")) as Settings;
 }
-
-/**
- * Formula sementara Momentum Score -> Level.
- * Kurva akar kuadrat: makin tinggi level, makin banyak momentum yang
- * dibutuhkan, supaya grinding 1 hari tidak melonjakkan level.
- * Sesuaikan saat tuning (lihat PRD §8).
- */
-export function calculateLevel(momentum: number): number {
-  if (momentum <= 0) return 1;
-  return Math.floor(Math.sqrt(momentum / 10)) + 1;
-}
+// End of file.
